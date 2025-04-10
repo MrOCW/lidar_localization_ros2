@@ -15,6 +15,7 @@ PCLLocalization::PCLLocalization(const rclcpp::NodeOptions & options)
   declare_parameter("ndt_step_size", 0.1);
   declare_parameter("ndt_max_iterations", 35);
   declare_parameter("ndt_num_threads", 4);
+  declare_parameter("min_align_frequency", 1.0);
   declare_parameter("transform_epsilon", 0.01);
   declare_parameter("voxel_leaf_size", 0.2);
   declare_parameter("scan_max_range", 100.0);
@@ -40,7 +41,8 @@ using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface
 CallbackReturn PCLLocalization::on_configure(const rclcpp_lifecycle::State &)
 {
   RCLCPP_INFO(get_logger(), "Configuring");
-
+  rclcpp::Clock system_clock;
+  last_align_time_ = system_clock.now();
   initializeParameters();
   initializePubSub();
   initializeRegistration();
@@ -102,7 +104,7 @@ CallbackReturn PCLLocalization::on_activate(const rclcpp_lifecycle::State &)
       registration_->setInputTarget(map_cloud_ptr);
     }
 
-    map_recieved_ = true;
+    map_received_ = true;
   }
 
   RCLCPP_INFO(get_logger(), "Activating end");
@@ -162,6 +164,7 @@ void PCLLocalization::initializeParameters()
   get_parameter("ndt_step_size", ndt_step_size_);
   get_parameter("ndt_num_threads", ndt_num_threads_);
   get_parameter("ndt_max_iterations", ndt_max_iterations_);
+  get_parameter("min_align_frequency", min_align_frequency_);
   get_parameter("transform_epsilon", transform_epsilon_);
   get_parameter("voxel_leaf_size", voxel_leaf_size_);
   get_parameter("scan_max_range", scan_max_range_);
@@ -188,6 +191,7 @@ void PCLLocalization::initializeParameters()
   RCLCPP_INFO(get_logger(),"ndt_resolution: %lf", ndt_resolution_);
   RCLCPP_INFO(get_logger(),"ndt_step_size: %lf", ndt_step_size_);
   RCLCPP_INFO(get_logger(),"ndt_num_threads: %d", ndt_num_threads_);
+  RCLCPP_INFO(get_logger(),"min_align_frequency: %f", min_align_frequency_);
   RCLCPP_INFO(get_logger(),"transform_epsilon: %lf", transform_epsilon_);
   RCLCPP_INFO(get_logger(),"voxel_leaf_size: %lf", voxel_leaf_size_);
   RCLCPP_INFO(get_logger(),"scan_max_range: %lf", scan_max_range_);
@@ -298,7 +302,10 @@ void PCLLocalization::initialPoseReceived(const geometry_msgs::msg::PoseWithCova
   initialpose_recieved_ = true;
   corrent_pose_with_cov_stamped_ptr_ = msg;
   pose_pub_->publish(*corrent_pose_with_cov_stamped_ptr_);
-
+  if (!last_scan_ptr_){
+    RCLCPP_WARN(this->get_logger(), "Sensor point cloud not received yet");
+    return;
+  }
   cloudReceived(last_scan_ptr_);
   RCLCPP_INFO(get_logger(), "initialPoseReceived end");
 }
@@ -325,7 +332,7 @@ void PCLLocalization::mapReceived(const sensor_msgs::msg::PointCloud2::SharedPtr
     registration_->setInputTarget(map_cloud_ptr);
   }
 
-  map_recieved_ = true;
+  map_received_ = true;
   RCLCPP_INFO(get_logger(), "mapReceived end");
 }
 
@@ -423,8 +430,15 @@ void PCLLocalization::imuReceived(const sensor_msgs::msg::Imu::ConstSharedPtr ms
 
 void PCLLocalization::cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
-  if (!map_recieved_ || !initialpose_recieved_) {return;}
+  if (!map_received_ || !initialpose_recieved_) {
+    RCLCPP_INFO(get_logger(), "Either the map has not been loaded or initial pose has not been provided");
+    return;}
   RCLCPP_INFO(get_logger(), "cloudReceived");
+  rclcpp::Clock system_clock;
+  if (system_clock.now().seconds() - last_align_time_.seconds() < 1./min_align_frequency_){
+    RCLCPP_INFO(get_logger(), "Ignoring cloud due to frequency limit");
+    return;
+  }
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_ptr(new pcl::PointCloud<pcl::PointXYZI>);
   pcl::fromROSMsg(*msg, *cloud_ptr);
 
@@ -455,8 +469,8 @@ void PCLLocalization::cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSh
   Eigen::Matrix4f init_guess = affine.matrix().cast<float>();
 
   pcl::PointCloud<pcl::PointXYZI>::Ptr output_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-  rclcpp::Clock system_clock;
   rclcpp::Time time_align_start = system_clock.now();
+  last_align_time_ = time_align_start;
   registration_->align(*output_cloud, init_guess);
   rclcpp::Time time_align_end = system_clock.now();
 

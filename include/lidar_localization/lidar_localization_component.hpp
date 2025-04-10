@@ -90,8 +90,9 @@ public:
   nav_msgs::msg::Path::SharedPtr path_ptr_;
   sensor_msgs::msg::PointCloud2::ConstSharedPtr last_scan_ptr_;
 
-  bool map_recieved_{false};
+  bool map_received_{false};
   bool initialpose_recieved_{false};
+  rclcpp::Time last_align_time_;
 
   // parameters
   std::string global_frame_id_;
@@ -104,6 +105,7 @@ public:
   double score_threshold_;
   double ndt_resolution_;
   double ndt_step_size_;
+  double min_align_frequency_;
   double transform_epsilon_;
   double voxel_leaf_size_;
   bool use_pcd_map_{false};
