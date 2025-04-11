@@ -32,6 +32,9 @@ PCLLocalization::PCLLocalization(const rclcpp::NodeOptions & options)
   declare_parameter("initial_pose_qz", 0.0);
   declare_parameter("initial_pose_qw", 1.0);
   declare_parameter("use_odom", false);
+  declare_parameter("use_odom_pose", false);
+  declare_parameter("publish_global_odom", false);
+  declare_parameter("publish_global_base", true);
   declare_parameter("use_imu", false);
   declare_parameter("enable_debug", false);
 }
@@ -181,6 +184,9 @@ void PCLLocalization::initializeParameters()
   get_parameter("initial_pose_qz", initial_pose_qz_);
   get_parameter("initial_pose_qw", initial_pose_qw_);
   get_parameter("use_odom", use_odom_);
+  get_parameter("use_odom_pose", use_odom_pose_);
+  get_parameter("publish_global_odom", publish_global_odom_);
+  get_parameter("publish_global_base", publish_global_base_);
   get_parameter("use_imu", use_imu_);
   get_parameter("enable_debug", enable_debug_);
 
@@ -201,6 +207,9 @@ void PCLLocalization::initializeParameters()
   RCLCPP_INFO(get_logger(),"map_path: %s", map_path_.c_str());
   RCLCPP_INFO(get_logger(),"set_initial_pose: %d", set_initial_pose_);
   RCLCPP_INFO(get_logger(),"use_odom: %d", use_odom_);
+  RCLCPP_INFO(get_logger(),"use_odom_pose: %d", use_odom_pose_);
+  RCLCPP_INFO(get_logger(),"publish_global_odom: %d", publish_global_odom_);
+  RCLCPP_INFO(get_logger(),"publish_global_base: %d", publish_global_base_);
   RCLCPP_INFO(get_logger(),"use_imu: %d", use_imu_);
   RCLCPP_INFO(get_logger(),"enable_debug: %d", enable_debug_);
 }
@@ -292,6 +301,48 @@ void PCLLocalization::initializeRegistration()
   RCLCPP_INFO(get_logger(), "initializeRegistration end");
 }
 
+void PCLLocalization::publishMapToOdomTransform()
+{
+  // 1. Convert your localization result (map → base_link) into a tf2::Transform.
+  tf2::Transform T_map_to_base;
+  tf2::fromMsg(current_pose_with_cov_stamped_ptr_->pose.pose, T_map_to_base);
+
+  // 2. Look up the odom → base_link transform.
+  // Here we assume you have a tf2 buffer member variable named tf_buffer_
+  // and that your frame names are stored in odom_frame_id_ and base_frame_id_.
+  geometry_msgs::msg::TransformStamped odom_to_base_stamped;
+  try {
+    odom_to_base_stamped = tfbuffer_.lookupTransform(
+      odom_frame_id_,  // target frame: odom
+      base_frame_id_,  // source frame: base_link
+      rclcpp::Time(0));
+  } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN(this->get_logger(), "Could not get odom→base transform: %s", ex.what());
+      return;
+  }
+
+  // 3. Convert the odom→base transform into a tf2::Transform.
+  tf2::Transform T_odom_to_base;
+  tf2::fromMsg(odom_to_base_stamped.transform, T_odom_to_base);
+
+  // 4. Invert it to obtain base_link → odom.
+  tf2::Transform T_base_to_odom = T_odom_to_base.inverse();
+
+  // 5. Multiply the two transforms:
+  //      T_map→odom = T_map→base_link · T_base_link→odom.
+  tf2::Transform T_map_to_odom = T_map_to_base * T_base_to_odom;
+
+  // 6. Prepare the transform message to broadcast.
+  geometry_msgs::msg::TransformStamped map_to_odom_stamped;
+  map_to_odom_stamped.header.stamp = now();
+  map_to_odom_stamped.header.frame_id = global_frame_id_;
+  map_to_odom_stamped.child_frame_id = odom_frame_id_;
+  map_to_odom_stamped.transform = tf2::toMsg(T_map_to_odom);
+
+  // 7. Broadcast the map → odom transform.
+  broadcaster_.sendTransform(map_to_odom_stamped);
+}
+
 void PCLLocalization::initialPoseReceived(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
 {
   RCLCPP_INFO(get_logger(), "initialPoseReceived");
@@ -300,8 +351,8 @@ void PCLLocalization::initialPoseReceived(const geometry_msgs::msg::PoseWithCova
     return;
   }
   initialpose_recieved_ = true;
-  corrent_pose_with_cov_stamped_ptr_ = msg;
-  pose_pub_->publish(*corrent_pose_with_cov_stamped_ptr_);
+  current_pose_with_cov_stamped_ptr_ = msg;
+  pose_pub_->publish(*current_pose_with_cov_stamped_ptr_);
   if (!last_scan_ptr_){
     RCLCPP_WARN(this->get_logger(), "Sensor point cloud not received yet");
     return;
@@ -339,6 +390,7 @@ void PCLLocalization::mapReceived(const sensor_msgs::msg::PointCloud2::SharedPtr
 void PCLLocalization::odomReceived(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
 {
   if (!use_odom_) {return;}
+  if (!map_received_ || !initialpose_recieved_) {return;}
   RCLCPP_INFO(get_logger(), "odomReceived");
 
   double current_odom_received_time = msg->header.stamp.sec +
@@ -356,31 +408,91 @@ void PCLLocalization::odomReceived(const nav_msgs::msg::Odometry::ConstSharedPtr
 
   tf2::Quaternion previous_quat_tf;
   double roll, pitch, yaw;
-  tf2::fromMsg(corrent_pose_with_cov_stamped_ptr_->pose.pose.orientation, previous_quat_tf);
+  tf2::fromMsg(current_pose_with_cov_stamped_ptr_->pose.pose.orientation, previous_quat_tf);
 
   tf2::Matrix3x3(previous_quat_tf).getRPY(roll, pitch, yaw);
 
-  roll += msg->twist.twist.angular.x * dt_odom;
-  pitch += msg->twist.twist.angular.y * dt_odom;
-  yaw += msg->twist.twist.angular.z * dt_odom;
+  geometry_msgs::msg::Pose current_odom_pose = msg->pose.pose;
+  if (use_odom_pose_)
+  {
+    if (!previous_odom_pose_received_) {
+      // First time, store and return
+      previous_odom_pose_ = current_odom_pose;
+      previous_odom_pose_received_ = true;
+      return;
+    }
+    Eigen::Vector3d prev_position(
+      previous_odom_pose_.position.x,
+      previous_odom_pose_.position.y,
+      previous_odom_pose_.position.z);
 
-  Eigen::Quaterniond quat_eig =
-    Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()) *
-    Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
-    Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ());
+    tf2::Quaternion previous_quat_tf;
+    tf2::fromMsg(previous_odom_pose_.orientation, previous_quat_tf);
 
-  geometry_msgs::msg::Quaternion quat_msg = tf2::toMsg(quat_eig);
+    // Manual conversion: note that Eigen's constructor takes (w, x, y, z)
+    Eigen::Quaterniond prev_orientation(previous_quat_tf.getW(),
+                                    previous_quat_tf.getX(),
+                                    previous_quat_tf.getY(),
+                                    previous_quat_tf.getZ());
 
-  Eigen::Vector3d odom{
-    msg->twist.twist.linear.x,
-    msg->twist.twist.linear.y,
-    msg->twist.twist.linear.z};
-  Eigen::Vector3d delta_position = quat_eig.matrix() * dt_odom * odom;
+    Eigen::Vector3d curr_position(
+      current_odom_pose.position.x,
+      current_odom_pose.position.y,
+      current_odom_pose.position.z);
 
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.x += delta_position.x();
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.y += delta_position.y();
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.z += delta_position.z();
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.orientation = quat_msg;
+    tf2::Quaternion current_quat_tf;
+    tf2::fromMsg(current_odom_pose.orientation, current_quat_tf);
+    Eigen::Quaterniond curr_orientation(current_quat_tf.getW(),
+                                        current_quat_tf.getX(),
+                                        current_quat_tf.getY(),
+                                        current_quat_tf.getZ());
+
+    Eigen::Vector3d delta_position = curr_position - prev_position;
+    Eigen::Quaterniond delta_rotation = curr_orientation * prev_orientation.inverse();
+
+    tf2::Quaternion old_tf;
+    tf2::fromMsg(current_pose_with_cov_stamped_ptr_->pose.pose.orientation, old_tf);
+
+    // Manually construct an Eigen::Quaterniond
+    Eigen::Quaterniond old_eigen(old_tf.getW(),
+                                old_tf.getX(),
+                                old_tf.getY(),
+                                old_tf.getZ());
+
+    // Compute the new orientation by applying delta_rotation
+    Eigen::Quaterniond new_orientation = delta_rotation * old_eigen;
+
+    current_pose_with_cov_stamped_ptr_->pose.pose.position.x += delta_position.x();
+    current_pose_with_cov_stamped_ptr_->pose.pose.position.y += delta_position.y();
+    current_pose_with_cov_stamped_ptr_->pose.pose.position.z += delta_position.z();
+
+    current_pose_with_cov_stamped_ptr_->pose.pose.orientation = tf2::toMsg(new_orientation);
+
+    previous_odom_pose_ = current_odom_pose;
+  }
+  else{
+    roll += msg->twist.twist.angular.x * dt_odom;
+    pitch += msg->twist.twist.angular.y * dt_odom;
+    yaw += msg->twist.twist.angular.z * dt_odom;
+  
+    Eigen::Quaterniond quat_eig =
+      Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()) *
+      Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
+      Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ());
+  
+    geometry_msgs::msg::Quaternion quat_msg = tf2::toMsg(quat_eig);
+  
+    Eigen::Vector3d odom{
+      msg->twist.twist.linear.x,
+      msg->twist.twist.linear.y,
+      msg->twist.twist.linear.z};
+    Eigen::Vector3d delta_position = quat_eig.matrix() * dt_odom * odom;
+  
+    current_pose_with_cov_stamped_ptr_->pose.pose.position.x += delta_position.x();
+    current_pose_with_cov_stamped_ptr_->pose.pose.position.y += delta_position.y();
+    current_pose_with_cov_stamped_ptr_->pose.pose.position.z += delta_position.z();
+    current_pose_with_cov_stamped_ptr_->pose.pose.orientation = quat_msg;
+  }
 }
 
 void PCLLocalization::imuReceived(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
@@ -431,12 +543,29 @@ void PCLLocalization::imuReceived(const sensor_msgs::msg::Imu::ConstSharedPtr ms
 void PCLLocalization::cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
 {
   if (!map_received_ || !initialpose_recieved_) {
-    RCLCPP_INFO(get_logger(), "Either the map has not been loaded or initial pose has not been provided");
+    // RCLCPP_INFO(get_logger(), "Either the map has not been loaded or initial pose has not been provided");
     return;}
   RCLCPP_INFO(get_logger(), "cloudReceived");
   rclcpp::Clock system_clock;
   if (system_clock.now().seconds() - last_align_time_.seconds() < 1./min_align_frequency_){
     RCLCPP_INFO(get_logger(), "Ignoring cloud due to frequency limit");
+    if (publish_global_base_){
+      geometry_msgs::msg::TransformStamped transform_stamped;
+      transform_stamped.header.stamp = msg->header.stamp;
+      transform_stamped.header.frame_id = global_frame_id_;
+      transform_stamped.child_frame_id = base_frame_id_;
+      transform_stamped.transform.translation.x = current_pose_with_cov_stamped_ptr_->pose.pose.position.x;
+      transform_stamped.transform.translation.y = current_pose_with_cov_stamped_ptr_->pose.pose.position.y;
+      transform_stamped.transform.translation.z = current_pose_with_cov_stamped_ptr_->pose.pose.position.z;
+      transform_stamped.transform.rotation.x = current_pose_with_cov_stamped_ptr_->pose.pose.orientation.x;
+      transform_stamped.transform.rotation.y = current_pose_with_cov_stamped_ptr_->pose.pose.orientation.y;
+      transform_stamped.transform.rotation.w = current_pose_with_cov_stamped_ptr_->pose.pose.orientation.w;
+      transform_stamped.transform.rotation.z = current_pose_with_cov_stamped_ptr_->pose.pose.orientation.z;
+      broadcaster_.sendTransform(transform_stamped);
+    }
+    if (publish_global_odom_){
+      publishMapToOdomTransform();
+    }
     return;
   }
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_ptr(new pcl::PointCloud<pcl::PointXYZI>);
@@ -464,7 +593,7 @@ void PCLLocalization::cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSh
   registration_->setInputSource(tmp_ptr);
 
   Eigen::Affine3d affine;
-  tf2::fromMsg(corrent_pose_with_cov_stamped_ptr_->pose.pose, affine);
+  tf2::fromMsg(current_pose_with_cov_stamped_ptr_->pose.pose, affine);
 
   Eigen::Matrix4f init_guess = affine.matrix().cast<float>();
 
@@ -489,30 +618,36 @@ void PCLLocalization::cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSh
   Eigen::Quaterniond quat_eig(rot_mat);
   geometry_msgs::msg::Quaternion quat_msg = tf2::toMsg(quat_eig);
 
-  corrent_pose_with_cov_stamped_ptr_->header.stamp = msg->header.stamp;
-  corrent_pose_with_cov_stamped_ptr_->header.frame_id = global_frame_id_;
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.x = static_cast<double>(final_transformation(0, 3));
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.y = static_cast<double>(final_transformation(1, 3));
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.position.z = static_cast<double>(final_transformation(2, 3));
-  corrent_pose_with_cov_stamped_ptr_->pose.pose.orientation = quat_msg;
-  pose_pub_->publish(*corrent_pose_with_cov_stamped_ptr_);
+  current_pose_with_cov_stamped_ptr_->header.stamp = msg->header.stamp;
+  current_pose_with_cov_stamped_ptr_->header.frame_id = global_frame_id_;
+  current_pose_with_cov_stamped_ptr_->pose.pose.position.x = static_cast<double>(final_transformation(0, 3));
+  current_pose_with_cov_stamped_ptr_->pose.pose.position.y = static_cast<double>(final_transformation(1, 3));
+  current_pose_with_cov_stamped_ptr_->pose.pose.position.z = static_cast<double>(final_transformation(2, 3));
+  current_pose_with_cov_stamped_ptr_->pose.pose.orientation = quat_msg;
+  pose_pub_->publish(*current_pose_with_cov_stamped_ptr_);
 
-  geometry_msgs::msg::TransformStamped transform_stamped;
-  transform_stamped.header.stamp = msg->header.stamp;
-  transform_stamped.header.frame_id = global_frame_id_;
-  transform_stamped.child_frame_id = base_frame_id_;
-  transform_stamped.transform.translation.x = static_cast<double>(final_transformation(0, 3));
-  transform_stamped.transform.translation.y = static_cast<double>(final_transformation(1, 3));
-  transform_stamped.transform.translation.z = static_cast<double>(final_transformation(2, 3));
-  transform_stamped.transform.rotation = quat_msg;
-  broadcaster_.sendTransform(transform_stamped);
+  if (publish_global_base_){
+    geometry_msgs::msg::TransformStamped transform_stamped;
+    transform_stamped.header.stamp = msg->header.stamp;
+    transform_stamped.header.frame_id = global_frame_id_;
+    transform_stamped.child_frame_id = base_frame_id_;
+    transform_stamped.transform.translation.x = static_cast<double>(final_transformation(0, 3));
+    transform_stamped.transform.translation.y = static_cast<double>(final_transformation(1, 3));
+    transform_stamped.transform.translation.z = static_cast<double>(final_transformation(2, 3));
+    transform_stamped.transform.rotation = quat_msg;
+    broadcaster_.sendTransform(transform_stamped);
+  }
 
   geometry_msgs::msg::PoseStamped::SharedPtr pose_stamped_ptr(new geometry_msgs::msg::PoseStamped);
   pose_stamped_ptr->header.stamp = msg->header.stamp;
   pose_stamped_ptr->header.frame_id = global_frame_id_;
-  pose_stamped_ptr->pose = corrent_pose_with_cov_stamped_ptr_->pose.pose;
+  pose_stamped_ptr->pose = current_pose_with_cov_stamped_ptr_->pose.pose;
   path_ptr_->poses.push_back(*pose_stamped_ptr);
   path_pub_->publish(*path_ptr_);
+
+  if (publish_global_odom_){
+    publishMapToOdomTransform();
+  }
 
   last_scan_ptr_ = msg;
 

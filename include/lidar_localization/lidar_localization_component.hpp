@@ -55,6 +55,7 @@ public:
   void initializeParameters();
   void initializePubSub();
   void initializeRegistration();
+  void publishMapToOdomTransform();
   void initialPoseReceived(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
   void mapReceived(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
   void odomReceived(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
@@ -86,14 +87,15 @@ public:
 
   boost::shared_ptr<pcl::Registration<pcl::PointXYZI, pcl::PointXYZI>> registration_;
   pcl::VoxelGrid<pcl::PointXYZI> voxel_grid_filter_;
-  geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr corrent_pose_with_cov_stamped_ptr_;
+  geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr current_pose_with_cov_stamped_ptr_;
   nav_msgs::msg::Path::SharedPtr path_ptr_;
   sensor_msgs::msg::PointCloud2::ConstSharedPtr last_scan_ptr_;
 
   bool map_received_{false};
   bool initialpose_recieved_{false};
   rclcpp::Time last_align_time_;
-
+  bool previous_odom_pose_received_{false};
+  geometry_msgs::msg::Pose previous_odom_pose_;
   // parameters
   std::string global_frame_id_;
   std::string odom_frame_id_;
@@ -120,6 +122,9 @@ public:
   double initial_pose_qw_;
 
   bool use_odom_{false};
+  bool use_odom_pose_{false};
+  bool publish_global_odom_{false};
+  bool publish_global_base_{true};
   double last_odom_received_time_;
   bool use_imu_{false};
   bool enable_debug_{false};
