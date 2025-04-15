@@ -22,12 +22,13 @@
       initial_pose_qy: 0.0
       initial_pose_qz: 0.0
       initial_pose_qw: 0.0
+      distance_threshold: 0.5
       use_odom: true
       use_odom_pose: false
       publish_global_odom: true
       publish_global_base: false
       use_imu: false
-      enable_debug: true
+      enable_debug: false
       global_frame_id: map
       odom_frame_id: odom
       base_frame_id: base_link

@@ -33,6 +33,7 @@ PCLLocalization::PCLLocalization(const rclcpp::NodeOptions & options)
   declare_parameter("initial_pose_qw", 1.0);
   declare_parameter("use_odom", false);
   declare_parameter("use_odom_pose", false);
+  declare_parameter("distance_threshold", 0.5);
   declare_parameter("publish_global_odom", false);
   declare_parameter("publish_global_base", true);
   declare_parameter("use_imu", false);
@@ -187,6 +188,7 @@ void PCLLocalization::initializeParameters()
   get_parameter("use_odom_pose", use_odom_pose_);
   get_parameter("publish_global_odom", publish_global_odom_);
   get_parameter("publish_global_base", publish_global_base_);
+  get_parameter("distance_threshold", distance_threshold_);
   get_parameter("use_imu", use_imu_);
   get_parameter("enable_debug", enable_debug_);
 
@@ -206,6 +208,7 @@ void PCLLocalization::initializeParameters()
   RCLCPP_INFO(get_logger(),"use_pcd_map: %d", use_pcd_map_);
   RCLCPP_INFO(get_logger(),"map_path: %s", map_path_.c_str());
   RCLCPP_INFO(get_logger(),"set_initial_pose: %d", set_initial_pose_);
+  RCLCPP_INFO(get_logger(),"distance_threshold: %f", distance_threshold_);
   RCLCPP_INFO(get_logger(),"use_odom: %d", use_odom_);
   RCLCPP_INFO(get_logger(),"use_odom_pose: %d", use_odom_pose_);
   RCLCPP_INFO(get_logger(),"publish_global_odom: %d", publish_global_odom_);
@@ -391,7 +394,7 @@ void PCLLocalization::odomReceived(const nav_msgs::msg::Odometry::ConstSharedPtr
 {
   if (!use_odom_) {return;}
   if (!map_received_ || !initialpose_recieved_) {return;}
-  RCLCPP_INFO(get_logger(), "odomReceived");
+  // RCLCPP_INFO(get_logger(), "odomReceived");
 
   double current_odom_received_time = msg->header.stamp.sec +
     msg->header.stamp.nanosec * 1e-9;
@@ -545,10 +548,10 @@ void PCLLocalization::cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSh
   if (!map_received_ || !initialpose_recieved_) {
     // RCLCPP_INFO(get_logger(), "Either the map has not been loaded or initial pose has not been provided");
     return;}
-  RCLCPP_INFO(get_logger(), "cloudReceived");
+  // RCLCPP_INFO(get_logger(), "cloudReceived");
   rclcpp::Clock system_clock;
   if (system_clock.now().seconds() - last_align_time_.seconds() < 1./min_align_frequency_){
-    RCLCPP_INFO(get_logger(), "Ignoring cloud due to frequency limit");
+    // RCLCPP_INFO(get_logger(), "Ignoring cloud due to frequency limit");
     if (publish_global_base_){
       geometry_msgs::msg::TransformStamped transform_stamped;
       transform_stamped.header.stamp = msg->header.stamp;
@@ -614,6 +617,32 @@ void PCLLocalization::cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSh
   }
 
   Eigen::Matrix4f final_transformation = registration_->getFinalTransformation();
+  double dx = static_cast<double>(final_transformation(0, 3)) - current_pose_with_cov_stamped_ptr_->pose.pose.position.x;
+  double dy = static_cast<double>(final_transformation(1, 3)) - current_pose_with_cov_stamped_ptr_->pose.pose.position.y;
+  double dz = static_cast<double>(final_transformation(2, 3)) - current_pose_with_cov_stamped_ptr_->pose.pose.position.z;
+  double distance_change = std::sqrt(dx * dx + dy * dy + dz * dz);
+  double max_update = 0.05; // Maximum allowed update (meters)
+  if (distance_change > distance_threshold_) {
+    RCLCPP_ERROR(get_logger(), "Registration jump too big: %f m exceeds threshold %f m, capping update", distance_change, distance_threshold_);
+    
+    // Compute scaling factor to cap the update to max_update
+    double scale = max_update / distance_change;
+    
+    // Get the current pose position
+    double current_x = current_pose_with_cov_stamped_ptr_->pose.pose.position.x;
+    double current_y = current_pose_with_cov_stamped_ptr_->pose.pose.position.y;
+    double current_z = current_pose_with_cov_stamped_ptr_->pose.pose.position.z;
+    
+    // Compute the new, capped update: move from the current pose in the same direction as the computed delta but with limited magnitude.
+    double capped_x = current_x + dx * scale;
+    double capped_y = current_y + dy * scale;
+    double capped_z = current_z + dz * scale;
+    
+    // Replace the translation part of the transformation with the capped update.
+    final_transformation(0, 3) = static_cast<float>(capped_x);
+    final_transformation(1, 3) = static_cast<float>(capped_y);
+    final_transformation(2, 3) = static_cast<float>(capped_z);
+  }
   Eigen::Matrix3d rot_mat = final_transformation.block<3, 3>(0, 0).cast<double>();
   Eigen::Quaterniond quat_eig(rot_mat);
   geometry_msgs::msg::Quaternion quat_msg = tf2::toMsg(quat_eig);

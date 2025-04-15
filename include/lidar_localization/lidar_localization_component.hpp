@@ -120,7 +120,7 @@ public:
   double initial_pose_qy_;
   double initial_pose_qz_;
   double initial_pose_qw_;
-
+  double distance_threshold_;
   bool use_odom_{false};
   bool use_odom_pose_{false};
   bool publish_global_odom_{false};
